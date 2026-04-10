@@ -95,3 +95,120 @@ GPU 不像 CPU 那样具备复杂的控制逻辑（如分支预测、推测执�
 * 不同 Warp 之间相互独立执行
 * 可并行执行的 block 和 warp 数量，取决于寄存器和共享内存的使用情况（包括 kernel 的需求以及每个多处理器可用的资源）
 
+## Parallel Reduction
+
+> 问题：求一个数组中所有元素的和
+
+### 版本1
+
+![image-20260410140915108](./assets/image-20260410140915108.png)
+
+最简单的方法：每个thread负责Values中 下标等于自己tid的数据
+
+比如step1时，相加结果保存到0，2，4，…… 那么相加的运算也由tid为0，2，4，……的thread负责
+
+```cpp
+__global__ void reduce0(int *g_idata, int *g_odata) {
+  extern __shared__ int sdata[];
+  // each thread loads one element from global to shared mem
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  sdata[tid] = g_idata[i];
+  __syncthreads();
+  
+  // do reduction in shared mem
+  for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+    if (tid % (2 * s) == 0) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+  
+  // write result for this block to global mem
+  if (tid == 0) g_odata[blockIdx.x] = sdata[0];
+}
+```
+
+> [!WARNING]
+>
+> `if (tid % (2 * s) == 0)`这种判断，造成了warp分支发散导致性能下降
+>
+> 直接用tid作为下标，对应关系：
+>
+> ```
+> 0 -> 0
+> 2 -> 2
+> 4 -> 4
+> ```
+>
+> **这样基数tid的线程就得不到运行**
+>
+> 取模操作非常耗时
+
+### 版本2
+
+> [!NOTE]
+>
+> tid取值为0，1，2，3，……而每次存储相加结果的下标，与tid有如下关系：
+>
+> Step1: tid的2倍
+>
+> Step2: tid的4倍
+>
+> ……
+
+为了避免warp发散，可以做如下设计：
+
+```cpp
+for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+  int index = 2 * s * tid;
+  
+  if (index < blockDim.x) {
+    sdata[index] += sdata[index + s];
+  }
+  __syncthreads();
+}
+```
+
+现在前一半线程运行，后一半线程不运行，分支比版本1更规整
+
+### 版本3
+
+> [!WARNING]
+>
+> 版本2虽然做到了线程连续，一定程度提升了性能，但数据访问却不是连续的
+>
+> 问题出在index计算，每个线程在步长较大时，访问sdata可能跨度极大，导致cache利用不佳
+>
+> 所以我们直接更改算法，每个Step将相加结果保存在连续的存储空间中
+
+![image-20260410145458806](./assets/image-20260410145458806.png)
+
+```cpp
+for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
+  if (tid < s) {
+    sdata[tid] += sdata[tid + s];
+  }
+  __syncthreads();
+}
+```
+
+### 版本4
+
+> [!WARNING]
+>
+> 虽然这种写法让线程分支更加规整，但 `if (tid < s)` 仍然意味着在每一轮归约中有一半的线程处于空闲状态，从硬件利用率角度来看是一种浪费。
+>
+> 一个自然的优化思路是：既然只需要一半的线程就可以完成当前 block 的归约工作，那么可以让这些线程在一开始就承担更多的数据处理任务，从而提高整体计算密度。
+>
+> 具体来说，可以让每个线程在加载阶段同时处理两个数据元素（而不是一个），先在寄存器中完成一次局部累加，再写入 shared memory。这样一来，每个 block 实际上处理的数据量翻倍，但线程数量不变，从而减少了后续归约阶段中线程空闲带来的浪费。
+
+```cpp
+unsigned int tid = threadIdx.x;
+unsigned int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+sdata[tid] = g_idata[i] + g_idata[i + blockDim.x];
+__syncthreads();
+```
+
+
+
