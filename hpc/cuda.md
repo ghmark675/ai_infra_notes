@@ -210,5 +210,203 @@ sdata[tid] = g_idata[i] + g_idata[i + blockDim.x];
 __syncthreads();
 ```
 
+### 版本5
 
+> [!WARNING]
+>
+> 注意到，s <= 32时，由于有`if (tid < s)`的判断，此时只有一个warp了
+>
+> 一个warp中的threads，遵循SIMD规则。他们执行的都是同一条指令，但对应的不同数据。执行顺序是硬件保证一致的
+>
+> 所以，我们没必要`__syncthreads()`了，因为一个warp中的threads一定是一起执行完某条指令才会继续执行
+>
+> 我们也没必要进行`if (tid < s)`的判断了
+>
+> 对于一个warp的处理，可以直接展开，而不是用循环
 
+```cpp
+__device__ void warpReduce(volatile int* sdata, int tid) {
+	sdata[tid] += sdata[tid + 32];
+  sdata[tid] += sdata[tid + 16];
+  sdata[tid] += sdata[tid + 8];
+  sdata[tid] += sdata[tid + 4];
+  sdata[tid] += sdata[tid + 2];
+  sdata[tid] += sdata[tid + 1];
+}
+
+...
+  
+for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+  if (tid < s) {
+    sdata[tid] += sdata[tid + s];
+  }
+  __syncthreads();
+}
+
+if (tid < 32) warpReduce(sdata, tid);
+```
+
+> [!NOTE]
+>
+> 这对所有warps都有效，而不只是最后一个warp
+>
+> 如果不展开的话，所有warps都会执行循环，进行if判断，非常低效
+
+### 版本6
+
+> [!WARNING]
+>
+> 版本5的代码，看上去有越界的风险
+>
+> 比如blockSize如果大于等于32，那么`sdata[tid] += sdata[tid + 32];`就可能会越界
+>
+> 所以必须对blockSize进行判断
+>
+> 这里利用c++的模板，可以实现编译期确定blockSize和运行分支
+
+```cpp
+template <unsigned int blockSize>
+__device__ void warpReduce(volatile int* sdata, unsigned int tid) {
+    if (blockSize >= 64) sdata[tid] += sdata[tid + 32];
+    if (blockSize >= 32) sdata[tid] += sdata[tid + 16];
+    if (blockSize >= 16) sdata[tid] += sdata[tid + 8];
+    if (blockSize >= 8)  sdata[tid] += sdata[tid + 4];
+    if (blockSize >= 4)  sdata[tid] += sdata[tid + 2];
+    if (blockSize >= 2)  sdata[tid] += sdata[tid + 1];
+}
+```
+
+这样，**编译器会直接删除不满足的 if 分支**。如果编译期发现blockSize是小于64的，那么第一条语句会被删除，只剩下后面5个相加语句
+
+并且，**GPU限制一个block最多512threads**（这在 今天的GPU架构中可能并不成立，即便不是512，总是个不大的数字就对了），我们甚至可以完全展开代码，实现没有循环的版本，消除分支预测开销
+
+```cpp
+if (blockSize >= 512) {
+  if (tid < 256) { sdata[tid] += sdata[tid + 256]; } __syncthreads();
+}
+if (blockSize >= 256) {
+  if (tid < 128) { sdata[tid] += sdata[tid + 128]; } __syncthreads();
+}
+if (blockSize >= 128) {
+  if (tid < 64) { sdata[tid] += sdata[tid + 64]; } __syncthreads();
+}
+if (tid < 32) warpReduce<blockSize>(sdata, tid);
+```
+
+其实只是根据blockSize的大小，把之前的for循环展开写罢了。这样可以大大降低分支预测开销
+
+> [!WARNING]
+>
+> 但是c++模板需要blockSize是一个编译期常量，但我们只能通过blockDim.x获得，这显然是一个运行时确定的量
+>
+> 我们只需要用switch语句枚举即可
+
+```cpp
+switch (threadsPerBlock)
+{
+    case 512:
+        reduce5<512><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 256:
+        reduce5<256><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 128:
+        reduce5<128><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 64:
+        reduce5<64><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 32:
+        reduce5<32><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 16:
+        reduce5<16><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 8:
+        reduce5<8><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 4:
+        reduce5<4><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 2:
+        reduce5<2><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    case 1:
+        reduce5<1><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+
+    default:
+        // 如果传入非 2 的幂的大小，可以 fallback 到 256 或报错
+        printf("Error: Unsupported block size %d\n", threadsPerBlock);
+        // 或者 fallback 处理：
+        // reduce5<256><<<dimGrid, dimBlock, smemSize>>>(d_idata, d_odata);
+        break;
+}
+```
+
+### 版本7
+
+> 线程是否我们定义多少，就会创建多少？
+
+**从逻辑视角看**：是的。当我们启动 Kernel 时，定义的线程数决定了 `threadIdx` 的取值范围。你可以定义成千上万个线程，逻辑上它们都是独立存在的。
+
+**从硬件视角看**：并非如此。GPU 的物理资源（如 SM 流式多处理器、寄存器、并行执行单元）是有限的。硬件会根据资源情况，将这些逻辑线程分批次地调度到物理核心上执行。即使你定义了 100 万个线程，硬件也只是通过快速切换和流水线操作，让你“感觉”它们在同时运行。
+
+那么当定义的数量比物理核心数量多时，就一部分、一部分的创建，只是保证thread id还是那么多
+
+对于求数组和的这个问题，我们之前的所有讨论实际上都基于：每个thread对应一个数组元素
+
+也就是说，如果数组有N个元素，我们在调用kernel时，就会像这样去创建：
+```cpp
+int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+
+kernel<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
+```
+
+在评估并行算法时，我们引入 **Cost（功耗/开销）** 的概念：
+$$
+\text{Cost} = \text{处理器数量 (P)} \times \text{时间复杂度 (T)}
+$$
+在这里，根据之前给的算法图容易得到，step的数量是O(logN)的，也就是一个线程的复杂度是O(logN)，那如果我们创建了N个线程，Cost就是N * logN 了
+
+这并非最佳的Cost
+
+其实也很好理解，线程的数量显然不是越多越好，一个恰当的线程数的值能带来极大的性能提升
+
+我们可以创建 N / logN 个线程，这样乘以复杂度logN后，Cost就是O(N)的了
+
+> 但此时要注意一个问题，定义线程数量减少，那么一个线程就要负责多个数组元素了，具体的对应关系是什么呢？
+
+其实可以让block的结构不变，这时一个grid中的线程数量减少，要处理N个数组元素，那么自然会出现多个grid（以前只有一个grid）
+
+这样每个thread都去处理各个grid中对应自己的那个元素即可
+
+可以在loaddata时，就直接将各个grid中对应自己的那个元素加起来
+
+```cpp
+unsigned int tid = threadIdx.x;
+unsigned int i = blockIdx.x * (blockSize * 2) + threadIdx.x;
+unsigned int gridSize = blockSize * 2 * gridDim.x;
+sdata[tid] = 0;
+
+while (i < n) {
+  sdata[tid] += g_idata[i] + g_idata[i + blockSize];
+  i += gridSize;
+}
+__syncthreads();
+```
+
+**这样做的优势：**
+
+1. **解耦性**：线程块的数量不再受限于数组长度 N。
+2. **可扩展性**：同一份代码可以根据不同的硬件（SM 数量不同）自动调整负载。
+3. **效率**：通过让每个线程在进入共享内存规约前先处理多个元素的累加，极大地减少了线程间同步的开销。
