@@ -410,3 +410,39 @@ __syncthreads();
 1. **解耦性**：线程块的数量不再受限于数组长度 N。
 2. **可扩展性**：同一份代码可以根据不同的硬件（SM 数量不同）自动调整负载。
 3. **效率**：通过让每个线程在进入共享内存规约前先处理多个元素的累加，极大地减少了线程间同步的开销。
+
+### Warp 级洗牌函数
+
+[学习资料](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/)
+
+从 Volta 架构（GV100, RTX 20系列）开始，NVIDIA 引入了**独立线程调度**（Independent Thread Scheduling）。这意味着 Warp 内的 32 个线程不再总是步调一致地执行——每个线程拥有独立的程序计数器（PC），可以独立分支。
+
+在这种情况下，如果需要获取同一 Warp 内其他线程的变量值，可以使用 Warp 级洗牌函数（Shuffle Functions），直接在寄存器层面交换数据，比通过共享内存更高效。
+
+#### `__shfl_down_sync()` 函数
+
+函数原型：
+
+```cpp
+int __shfl_down_sync(unsigned int mask, int var, unsigned int offset, 
+                     int width = warpSize);
+```
+
+**功能**：返回同一 Warp 中 `laneId + offset` 位置线程的 `var` 值。
+
+**参数说明**：
+
+- `mask`：32 位掩码，指定哪些线程参与本次同步（为 1 的位表示参与）
+- `var`：当前线程要广播的变量值
+- `offset`：偏移量，当前线程从 `laneId + offset` 位置的线程获取 `var` 值
+- `width`：指定 warp 的宽度，默认为 32（`warpSize`）
+
+> [!NOTE]
+> "laneId" 是 Warp 内线程的逻辑编号（0~31），可通过 `threadIdx.x % 32` 或 `lane_id()` 内置函数获取。
+
+**常见洗牌函数变体**：
+
+- `__shfl_sync()`：从指定 lane ID 获取值
+- `__shfl_up_sync()`：从编号更小的线程获取值
+- `__shfl_xor_sync()`：通过异或运算确定目标线程
+
